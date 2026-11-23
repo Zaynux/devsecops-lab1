@@ -1,4 +1,4 @@
-name: DevSecOps CI Pipeline
+name: DevSecOps Security Pipeline
 
 on:
   push:
@@ -7,29 +7,75 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  sast-semgrep:
+    name: SAST - Analisis Estatico (Semgrep)
     runs-on: ubuntu-latest
-
+    container:
+      image: semgrep/semgrep
     steps:
-      - name: Descargar codigo fuente
+      - name: Checkout del codigo fuente
         uses: actions/checkout@v4
 
-      - name: Configurar Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
+      - name: Escaneo Semgrep - JavaScript y secretos
+        run: semgrep scan --config=p/javascript --config=p/secrets --metrics=off --error .
 
-      - name: Instalar dependencias
-        run: npm ci
+  container-security:
+    name: SCA - Escaneo de Imagen Docker (Trivy)
+    runs-on: ubuntu-latest
+    needs: sast-semgrep
+    steps:
+      - name: Checkout del codigo fuente
+        uses: actions/checkout@v4
 
-      - name: Verificar sintaxis de JavaScript
-        run: node --check src/index.js
+      - name: Construir imagen Docker
+        run: docker build -t devsecops-app:${{ github.sha }} .
 
-      - name: Probar funcionamiento del servidor
+      - name: Escanear imagen Docker con Trivy
         run: |
-          node src/index.js &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
-          sleep 3
-          curl --fail --silent --show-error http://localhost:3000
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --format table \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --vuln-type os,library \
+            --severity CRITICAL,HIGH,MEDIUM \
+            devsecops-app:${{ github.sha }}
+
+  dast-runtime-test:
+    name: DAST - Pruebas Dinamicas sobre Contenedor Activo
+    runs-on: ubuntu-latest
+    needs: container-security
+    steps:
+      - name: Checkout del codigo fuente
+        uses: actions/checkout@v4
+
+      - name: Construir imagen para pruebas dinamicas
+        run: docker build -t devsecops-dast:test .
+
+      - name: Levantar contenedor inyectando GitHub Secret
+        env:
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY }}
+        run: |
+          test -n "$API_SECRET_KEY" || { echo "Falta API_SECRET_KEY en GitHub Secrets"; exit 1; }
+          docker run -d --name dast-target -p 3000:3000 \
+            -e API_SECRET_KEY \
+            devsecops-dast:test
+
+      - name: Validar endpoints HTTP y carga segura del secreto
+        run: |
+          for n in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent http://localhost:3000/ >/dev/null; then break; fi
+            sleep 2
+          done
+          echo "--- Endpoint principal ---"
+          curl --fail --silent --show-error http://localhost:3000/
+          echo
+          echo "--- Estado de la API (solo indicador, no secreto) ---"
+          RESPONSE=$(curl --fail --silent --show-error http://localhost:3000/api/status)
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -F '"secretLoaded":true'
+
+      - name: Limpiar contenedor de prueba
+        if: always()
+        run: docker rm -f dast-target 2>/dev/null || true
